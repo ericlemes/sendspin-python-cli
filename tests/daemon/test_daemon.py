@@ -6,7 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from aiosendspin.models.types import PlayerCommand
+from aiosendspin.models.player import SupportedAudioFormat
+from aiosendspin.models.types import AudioCodec, PlayerCommand, Roles
 from aiosendspin.noise import Identity, InMemoryClientPairingStore
 
 from sendspin.daemon.daemon import DaemonArgs, SendspinDaemon
@@ -48,6 +49,23 @@ def _make_daemon(tmp_path: Path, *, settings_volume: int, settings_muted: bool) 
         use_mpris=False,
     )
     return SendspinDaemon(args)
+
+
+@pytest.mark.parametrize("capture_dir", [None, "recordings"])
+async def test_capture_requests_metadata_without_mpris(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture_dir: str | None
+) -> None:
+    """A headless capture must receive metadata even on systems without MPRIS."""
+    daemon = _make_daemon(tmp_path, settings_volume=25, settings_muted=False)
+    daemon._args.capture_dir = capture_dir
+    daemon._audio_handler = _FakeAudioHandler(volume=25, muted=False)
+    monkeypatch.setattr(
+        "sendspin.daemon.daemon.detect_supported_audio_formats",
+        lambda _: [SupportedAudioFormat(AudioCodec.PCM, 2, 48_000, 16)],
+    )
+    client = daemon._create_client()
+    assert (Roles.METADATA in client.roles) == (capture_dir is not None)
+    assert (Roles.CONTROLLER in client.roles) == (capture_dir is not None)
 
 
 def test_volume_command_uses_audio_handler_muted_state_for_external_volume(tmp_path: Path) -> None:

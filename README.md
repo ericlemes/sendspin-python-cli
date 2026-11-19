@@ -117,6 +117,7 @@ Settings are stored in `~/.config/sendspin/`:
   "name": "Living Room",
   "audio_device": "2",
   "audio_format": "flac:48000:24:2",
+  "capture_dir": null,
   "log_level": "INFO",
   "listen_port": 8927,
   "use_mpris": true,
@@ -151,6 +152,7 @@ Settings are stored in `~/.config/sendspin/`:
 | `name` | string | All | Friendly name for client or server (`--name`) |
 | `audio_device` | string | TUI/daemon | Audio device index, name prefix, or ALSA device name (`--audio-device`) |
 | `audio_format` | string | TUI/daemon | Preferred audio format (`--audio-format`, e.g., `flac:48000:24:2`) |
+| `capture_dir` | string or null | TUI/daemon | Opt-in diagnostic PCM and metadata recording directory (`--capture-dir`). Disabled by default |
 | `log_level` | string | All | Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL |
 | `listen_port` | integer | daemon/serve | Listen port (`--port`, default: 8927) |
 | `use_mpris` | boolean | TUI/daemon | Enable MPRIS integration (default: true) |
@@ -168,6 +170,142 @@ Settings are stored in `~/.config/sendspin/`:
 | `clients` | array | serve | Client URLs to connect to (`--client`) |
 
 Settings are automatically saved when changed through the TUI. You can also edit the JSON file directly while the client is not running.
+
+### Diagnostic audio capture
+
+To collect data for investigating sample-accurate track extraction, enable capture in either mode:
+
+```powershell
+sendspin --capture-dir .\recordings
+sendspin daemon --capture-dir .\recordings --url ws://host:port/sendspin
+```
+
+Alternatively, set `"capture_dir": "recordings"` in the relevant settings file. The CLI
+directory takes precedence. Remove the setting or set it to `null` to disable capture.
+Each run creates a unique subdirectory containing:
+
+- `session.json`: schema version, UTC start time, PCM representation and capture configuration.
+- `audio-000001.wav`, etc.: unmodified decoded PCM, split at exactly 600 seconds of
+  sample frames. Format changes, player stream starts/clears/ends and disconnects
+  finish the current file early. The final file may also be shorter.
+- `events.jsonl`: one JSON object per line, including full SDK-serialized current
+  and scheduled metadata payloads, controller/group updates, stream lifecycle
+  messages, audio formats (including hex codec headers), and an audio packet index.
+  Metadata includes its original server-clock `timestamp`, progress and artwork URL
+  when supplied; artwork image bytes are not downloaded.
+
+Audio is independently decoded on a bounded capture worker, before volume, mute,
+drift correction or playback buffering can modify or discard samples. It captures
+**received audio**, including buffered audio later cleared by a seek, not necessarily
+what was heard. No silence is inserted for timestamp gaps, and overlaps are not
+removed. Playback continues normally; capture adds decoding and disk I/O overhead.
+
+Each journal observation includes a sequence number, UTC and monotonic observation
+times, client-clock time, synchronization status and, when synchronized, an estimated
+server-clock time with playback delay excluded. The configured output delay and
+server ID/name are also included when available. Observation time means
+the SDK callback time, not necessarily the original network arrival time (especially
+for current metadata that was previously scheduled).
+
+Each `audio` index row maps a packet's original `server_timestamp_us` and
+`send_ahead_us` to `file`, `file_frame_offset`, `frame_count`,
+`packet_frame_offset` and `packet_frame_count`. Offsets/counts are **sample frames**
+(one sample per channel), not bytes. A packet split across files has multiple rows.
+The exact effective start time of a row is its packet timestamp plus
+`packet_frame_offset * 1_000_000 / sample_rate` microseconds; retain this as a rational
+value when exact timing matters. The preceding `format` event supplies the sample
+rate, bit depth and channel count; each WAV header also contains these values.
+
+Read the journal using Python's standard JSON parser:
+
+```python
+import json
+from pathlib import Path
+
+capture = Path("recordings") / "YOUR_CAPTURE_DIRECTORY"
+with (capture / "events.jsonl").open(encoding="utf-8") as journal:
+    for line in journal:
+        event = json.loads(line)
+        if event["type"] in {"metadata_scheduled", "metadata_current"}:
+            print(event["payload"])
+```
+
+Stop normally to drain pending records and finalize WAV headers. The final
+`capture_end` event has `complete: true` on success. A decoder error, invalid PCM or
+queue overflow stops capture and logs an error; where the disk remains writable,
+`capture_end` records `complete: false` and the error. A missing `capture_end` means
+the capture was interrupted or could not be finalized, so treat it as incomplete.
+Disk errors are logged and may prevent the failure marker from being written.
+
+This is diagnostic data, **not yet guaranteed track-perfect extraction**. Metadata
+effective times are not guaranteed track starts, and seeks/crossfades may need
+additional server-provided boundary information. SDK-parsed metadata is preserved,
+not raw WebSocket messages or unknown fields discarded by the SDK. There is no
+retention limit: 48 kHz stereo 16-bit PCM uses about 115 MB per 10 minutes
+(24-bit uses about 173 MB), plus journal data. Captures contain audio and potentially
+private metadata/URLs; only record content you are authorized to save and review it
+before sharing.
+
+### Splitting a capture into tracks
+
+Run the offline splitter after stopping capture (no server or audio output device is needed):
+
+```bash
+sendspin split-tracks recordings/20261119T141317Z-uz9mi3xu
+```
+
+By default this creates a new `tracks` directory inside the capture, with numbered
+`Artist - Title.wav` files and a `tracks.json` report. Use `--output-dir PATH` to
+choose a different **new** directory. Existing output directories are never overwritten,
+and source recordings are never modified.
+
+Choose lossless FLAC or AIFF output with `--format` (WAV remains the default):
+
+```bash
+sendspin split-tracks recordings/20261119T141317Z-uz9mi3xu --format flac --output-dir tracks-flac
+sendspin split-tracks recordings/20261119T141317Z-uz9mi3xu --format aiff --output-dir tracks-aiff
+```
+
+FLAC exports include standard Vorbis comments; AIFF exports include ID3v2 text tags.
+The available **title, artist, album, album artist, year and original album track
+number** are embedded in each file. The output sequence number is not substituted
+for the album track number. Unknown tags are left unset; the full captured metadata
+remains in `tracks.json`. Export is fully offline: artwork URLs are not fetched and
+cover art is not embedded. WAV output is unchanged and keeps metadata in the report.
+
+Sample rate, channel count and PCM sample values are preserved. FLAC supports
+16- and 24-bit capture audio with the bundled encoder; 32-bit FLAC export is rejected
+rather than silently reducing precision (use AIFF or WAV for 32-bit audio). AIFF
+supports 16-, 24- and 32-bit PCM. The existing PyAV dependency supplies the encoders;
+no separate ffmpeg executable is needed. FLAC/AIFF export uses a temporary WAV per
+track, removed after encoding, so allow additional disk space for the largest track.
+
+The splitter uses **current metadata effective timestamps exactly as recorded**;
+it does not subtract reported progress or infer earlier track starts. Canceled scheduled
+updates are ignored. Cuts fall on the first complete sample frame at or after a timestamp.
+Tracks spanning multiple capture WAVs are joined without lossy encoding, gain changes,
+silence insertion, or removal of overlapping audio. Progress-only and artwork-only
+updates do not create a new track. Changes to title, artist, album, album artist,
+track number or year do.
+
+Stream restarts/clears/ends, connection/server changes, format changes, and timestamp
+gaps/overlaps larger than one sample frame create separate numbered parts, even if the
+track name stays the same. Audio without timestamped metadata is saved as `Unknown`.
+All indexed frames are retained, including received audio that playback later cleared.
+Consequently, a seek or pause/resume may produce partial or overlapping parts rather
+than a single clean song.
+
+`tracks.json` contains the full current-metadata observations, each output's metadata,
+source WAV frame ranges and output offsets, exact rational server-clock start/end
+times, and warnings. Its `complete` field means splitting completed, **not** that the
+tracks have proven musical boundaries or that the input capture was complete. A failed
+write leaves a report marked incomplete when possible; use a different output directory
+for a retry.
+
+This is a lossless diagnostic partition, not guaranteed track-perfect extraction:
+late metadata can place a small portion of the next song in the previous file;
+crossfades and consecutive plays of the same metadata cannot be reliably separated.
+The report preserves the source mapping so these decisions can be revisited.
 
 ### Server Connection
 

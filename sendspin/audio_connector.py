@@ -16,6 +16,7 @@ from aiosendspin.models.types import AudioCodec
 
 from sendspin.audio import AudioPlayer
 from sendspin.audio_devices import AudioDevice
+from sendspin.capture import AudioCapture
 from sendspin.decoder import FlacDecoder
 from sendspin.utils import create_task
 
@@ -350,6 +351,7 @@ class AudioStreamHandler:
         on_format_change: Callable[[str | None, int, int, int], None] | None = None,
         on_volume_change: Callable[[int, bool], None] | None = None,
         volume_controller: VolumeController | None = None,
+        capture_dir: str | None = None,
     ) -> None:
         """Initialize the audio stream handler.
 
@@ -361,6 +363,7 @@ class AudioStreamHandler:
             on_format_change: Callback for format changes (codec, sample_rate, bit_depth, channels).
             on_volume_change: Callback for volume changes.
             volume_controller: Optional external volume controller backend.
+            capture_dir: Optional directory for diagnostic PCM and metadata capture.
         """
         self._audio_device = audio_device
         self._volume = volume
@@ -380,6 +383,8 @@ class AudioStreamHandler:
 
         self._volume_controller: VolumeController | None = volume_controller
         self._chunks_dropping = False
+        self._capture_dir = capture_dir
+        self._capture: AudioCapture | None = None
 
     @property
     def volume(self) -> int:
@@ -463,6 +468,8 @@ class AudioStreamHandler:
     def attach_client(self, client: SendspinClient) -> None:
         """Attach to a SendspinClient and register listeners."""
         self.detach_client()
+        if self._capture is None and self._capture_dir is not None:
+            self._capture = AudioCapture(self._capture_dir)
         self._client = client
         self._start_audio_worker(client)
 
@@ -472,9 +479,13 @@ class AudioStreamHandler:
             client.add_stream_end_listener(self._on_stream_end),
             client.add_stream_clear_listener(self._on_stream_clear),
         ]
+        if self._capture is not None:
+            self._capture.attach_client(client)
 
     def detach_client(self) -> None:
         """Detach from the current client and unregister audio listeners."""
+        if self._capture is not None:
+            self._capture.detach_client()
         for unsubscribe in self._client_unsubscribers:
             unsubscribe()
         self._client_unsubscribers = []
@@ -597,6 +608,9 @@ class AudioStreamHandler:
         """Stop audio worker, external volume monitoring, and clear resources."""
         self.detach_client()
         await self.handle_disconnect()
+
+        if self._capture is not None:
+            await self._capture.close()
 
         if self._volume_controller is not None:
             await self._volume_controller.stop_monitoring()

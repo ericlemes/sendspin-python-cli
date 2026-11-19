@@ -234,6 +234,7 @@ class AppArgs:
     output_delay_ms: float | None = None
     use_mpris: bool = True
     preferred_format: SupportedAudioFormat | None = None
+    capture_dir: str | None = None
     volume_controller: VolumeController | None = None
     hook_start: str | None = None
     hook_stop: str | None = None
@@ -485,6 +486,7 @@ class SendspinApp:
                 on_format_change=self._handle_format_change,
                 on_volume_change=self._on_volume_change,
                 volume_controller=args.volume_controller,
+                capture_dir=args.capture_dir,
             )
             await self._audio_handler.read_initial_volume()
 

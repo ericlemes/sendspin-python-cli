@@ -39,6 +39,15 @@ async def test_unpaired_access_from_settings_file(
     assert settings.unpaired_access is expected
 
 
+async def test_capture_directory_from_settings_file(tmp_path: Path) -> None:
+    """Diagnostic capture remains opt-in and its directory survives serialization."""
+    path = tmp_path / "settings-daemon.json"
+    path.write_text(json.dumps({"capture_dir": "recordings"}))
+    settings = await get_client_settings("daemon", str(tmp_path))
+    assert settings.capture_dir == "recordings"
+    assert settings.to_dict()["capture_dir"] == "recordings"
+
+
 async def test_legacy_static_delay_migrates_to_output_delay(tmp_path: Path) -> None:
     """Settings saved before the spec rename keep their delay and are rewritten."""
     path = tmp_path / "settings-daemon.json"

@@ -12,6 +12,7 @@ import traceback
 from collections.abc import Sequence
 from dataclasses import replace
 from importlib.metadata import version
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from sendspin.alsa_volume import AVAILABLE as ALSA_AVAILABLE
@@ -50,7 +51,7 @@ Please install PortAudio for your system:
 
 PLAYER_APP_SENTINEL = "player"
 EXPLICIT_APPS = frozenset(
-    {PLAYER_APP_SENTINEL, "daemon", "serve", "audio-devices", "servers", "clients"}
+    {PLAYER_APP_SENTINEL, "daemon", "serve", "audio-devices", "servers", "clients", "split-tracks"}
 )
 TOP_LEVEL_ACTIONS = frozenset({"-h", "--help", "--version"})
 
@@ -200,6 +201,11 @@ def _add_player_runtime_options(target: ArgumentTarget, *, suppress_defaults: bo
             "On Linux desktops, 'pulse', 'pipewire', or 'default' route through the sound "
             "server. Use 'sendspin audio-devices list' to see enumerated devices."
         ),
+    )
+    target.add_argument(
+        "--capture-dir",
+        default=default,
+        help="Save diagnostic PCM WAV chunks (10 minutes) and metadata JSONL in this directory",
     )
     target.add_argument(
         "--audio-format",
@@ -447,6 +453,11 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     daemon_parser.add_argument(
+        "--capture-dir",
+        default=None,
+        help="Save diagnostic PCM WAV chunks (10 minutes) and metadata JSONL in this directory",
+    )
+    daemon_parser.add_argument(
         "--audio-format",
         type=str,
         default=None,
@@ -524,6 +535,23 @@ def _build_parser() -> argparse.ArgumentParser:
             "interface only. Also restricts mDNS discovery to this interface. "
             "Useful when the system has multiple interfaces (e.g., LAN and WAN)."
         ),
+    )
+
+    split_parser = subparsers.add_parser(
+        "split-tracks", help="Split a diagnostic capture into tracks using metadata timestamps"
+    )
+    split_parser.add_argument(
+        "capture_dir", type=Path, help="Directory containing events.jsonl and WAVs"
+    )
+    split_parser.add_argument(
+        "--output-dir", type=Path, help="New output directory (default: CAPTURE_DIR/tracks)"
+    )
+    split_parser.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("wav", "flac", "aiff"),
+        default="wav",
+        help="Output audio format; FLAC and AIFF include text metadata tags (default: wav)",
     )
 
     # audio-devices subcommand
@@ -758,6 +786,7 @@ async def _run_daemon_mode(
         listen_port=args.listen_port,
         use_mpris=args.use_mpris,
         preferred_format=_resolve_preferred_format(args.audio_format, audio_device),
+        capture_dir=args.capture_dir,
         volume_controller=volume_controller,
         hook_start=args.hook_start,
         hook_stop=args.hook_stop,
@@ -788,6 +817,20 @@ def main() -> int:
             return 1
 
     # Handle utility subcommands
+    if args.command == "split-tracks":
+        from sendspin.track_splitter import split_tracks
+
+        try:
+            output = split_tracks(
+                args.capture_dir, args.output_dir, output_format=args.output_format
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Track splitting failed: {exc}")
+            return 1
+        print(f"Saved tracks and tracks.json to {output}")
+        print("Boundaries are metadata-based estimates; see tracks.json for limitations.")
+        return 0
+
     if args.command == "audio-devices":
         if args.audio_devices_command == "list":
             list_audio_devices()
@@ -880,6 +923,8 @@ async def _run_client_mode(args: argparse.Namespace) -> int:
     args.use_mpris = not args.disable_mpris and settings.use_mpris
     if args.audio_format is None:
         args.audio_format = settings.audio_format
+    if args.capture_dir is None:
+        args.capture_dir = settings.capture_dir
     if args.hardware_volume is None:
         if settings.use_hardware_volume is not None:
             args.hardware_volume = settings.use_hardware_volume
@@ -979,6 +1024,7 @@ async def _run_client_mode(args: argparse.Namespace) -> int:
         output_delay_ms=args.output_delay_ms,
         use_mpris=args.use_mpris,
         preferred_format=_resolve_preferred_format(args.audio_format, audio_device),
+        capture_dir=args.capture_dir,
         volume_controller=volume_controller,
         hook_start=args.hook_start,
         hook_stop=args.hook_stop,

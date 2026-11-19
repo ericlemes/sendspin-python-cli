@@ -45,6 +45,7 @@ class DaemonArgs:
     listen_port: int = 8928
     use_mpris: bool = True
     preferred_format: SupportedAudioFormat | None = None
+    capture_dir: str | None = None
     volume_controller: VolumeController | None = None
     hook_start: str | None = None
     hook_stop: str | None = None
@@ -81,7 +82,7 @@ class SendspinDaemon:
         """Create a new SendspinClient instance."""
         assert self._audio_handler is not None
         client_roles = [Roles.PLAYER]
-        if MPRIS_AVAILABLE and self._args.use_mpris:
+        if self._args.capture_dir is not None or (MPRIS_AVAILABLE and self._args.use_mpris):
             client_roles.extend([Roles.METADATA, Roles.CONTROLLER])
 
         supported_formats = detect_supported_audio_formats(self._args.audio_device)
@@ -163,6 +164,7 @@ class SendspinDaemon:
             on_format_change=self._handle_format_change,
             on_volume_change=self._on_volume_change,
             volume_controller=self._args.volume_controller,
+            capture_dir=self._args.capture_dir,
         )
         await self._audio_handler.read_initial_volume()
         await self._audio_handler.start_volume_monitor()
