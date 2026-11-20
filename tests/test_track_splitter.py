@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import wave
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -97,7 +98,7 @@ def test_split_inside_packet_and_join_rotated_files(tmp_path: Path, width: int) 
         },
         width=width,
     )
-    output = split_tracks(directory)
+    output = split_tracks(directory, boundary_mode="metadata")
     manifest, audio = _result(output)
     assert audio == [pcm[: 3 * frame_size], pcm[3 * frame_size :]]
     assert manifest["complete"] is True
@@ -489,3 +490,263 @@ def test_output_format_cli(
     )
     assert main() == 0
     assert list((directory / "tracks").glob(f"*.{output_format}"))
+
+
+def _progress(position: int, *, duration: int = 100_000, speed: int = 1000) -> dict:
+    return {"track_progress": position, "track_duration": duration, "playback_speed": speed}
+
+
+def test_late_metadata_no_longer_cuts_off_next_track_intro(tmp_path: Path) -> None:
+    """Use reported progress to recover a known transition instead of a blanket offset."""
+    directory = tmp_path / "capture"
+    old_pcm = b"\x11" * 1000 * 4
+    new_pcm = b"\x22" * 3000 * 4
+    _capture(
+        directory,
+        [
+            _metadata(0, "Old", progress=_progress(0)),
+            _audio("audio-000001.wav", 0, 4000, 0),
+            _metadata(2_510_000, "New", progress=_progress(1510)),
+            _metadata(3_500_000, "New", progress=_progress(2500)),
+        ],
+        {"audio-000001.wav": old_pcm + new_pcm},
+        rate=1000,
+    )
+    manifest, audio = _result(split_tracks(directory, tmp_path / "progress"))
+    assert audio == [old_pcm, new_pcm]
+    assert manifest["boundary_mode"] == "progress"
+    assert manifest["boundary_method"] == "progress_estimated_track_start"
+    boundary = manifest["tracks"][1]["boundary_estimate"]
+    assert boundary["metadata_timestamp_us"] == 2_510_000
+    assert boundary["split_timestamp_us"] == {"numerator": 1_000_000, "denominator": 1}
+    assert boundary["backdated_us"] == {"numerator": 1_510_000, "denominator": 1}
+    assert boundary["reason"] == "progress_estimate"
+    assert manifest["tracks"][1]["metadata"]["timestamp"] == 2_510_000
+    assert manifest["metadata_events"][2]["boundary_estimate"]["reason"] == "same_track_update"
+    raw_manifest, raw_audio = _result(
+        split_tracks(directory, tmp_path / "metadata", boundary_mode="metadata")
+    )
+    assert [track["frame_count"] for track in raw_manifest["tracks"]] == [2510, 1490]
+    assert b"".join(raw_audio) == old_pcm + new_pcm
+
+
+def test_progress_speed_scaling_uses_exact_frame_rounding(tmp_path: Path) -> None:
+    """A 1.5x playback speed requires a rational estimate, not a rounded millisecond shift."""
+    directory = tmp_path / "capture"
+    pcm = bytes(range(200))
+    _capture(
+        directory,
+        [
+            _metadata(0, "Old", progress=_progress(0)),
+            _audio("audio-000001.wav", 0, 50, 1_999_000),
+            _metadata(2_000_000, "New", progress=_progress(1, speed=1500)),
+        ],
+        {"audio-000001.wav": pcm},
+        rate=44_100,
+    )
+    manifest, audio = _result(split_tracks(directory))
+    assert audio == [pcm[: 15 * 4], pcm[15 * 4 :]]
+    boundary = manifest["tracks"][1]["boundary_estimate"]
+    expected = Fraction(2_000_000) - Fraction(2000, 3)
+    assert boundary["split_timestamp_us"] == {
+        "numerator": expected.numerator,
+        "denominator": expected.denominator,
+    }
+    assert manifest["tracks"][1]["sources"][0]["file_frame_offset"] == 15
+
+
+def test_very_late_track_update_is_not_limited_to_fixed_offset(tmp_path: Path) -> None:
+    """A delayed notification can arrive minutes into a track while PCM keeps streaming."""
+    directory = tmp_path / "capture"
+    pcm = bytes(range(200)) * 8
+    _capture(
+        directory,
+        [
+            _metadata(0, "Old", progress=_progress(0, duration=121_000)),
+            _audio("audio-000001.wav", 0, 400, 0),
+            _metadata(300_000_000, "New", progress=_progress(179_000, duration=385_000)),
+        ],
+        {"audio-000001.wav": pcm},
+        rate=1,
+    )
+    manifest, audio = _result(split_tracks(directory))
+    assert [track["frame_count"] for track in manifest["tracks"]] == [121, 279]
+    assert b"".join(audio) == pcm
+
+
+@pytest.mark.parametrize(
+    ("progress", "reason"),
+    [
+        (None, "missing_progress"),
+        (_progress(1510, speed=0), "paused"),
+        (_progress(1510, duration=0), "unknown_or_live_duration"),
+        (_progress(-1), "invalid_progress"),
+        (_progress(1510, speed=-1), "invalid_progress"),
+        (_progress(1510, duration=1000), "invalid_progress"),
+        ({**_progress(1510), "track_progress": True}, "invalid_progress"),
+        (_progress(1510), "would_cross_previous_metadata"),
+    ],
+)
+def test_unsafe_progress_falls_back_with_recorded_reason(
+    tmp_path: Path, progress: dict | None, reason: str
+) -> None:
+    directory = tmp_path / "capture"
+    pcm = bytes(range(80))
+    _capture(
+        directory,
+        [
+            _metadata(1_000_000, "Old", progress=_progress(0)),
+            _metadata(2_000_000, "New", progress=progress),
+            _audio("audio-000001.wav", 0, 20, 1_000_000),
+        ],
+        {"audio-000001.wav": pcm},
+    )
+    manifest, audio = _result(split_tracks(directory))
+    assert audio == [pcm[:40], pcm[40:]]
+    boundary = manifest["tracks"][1]["boundary_estimate"]
+    assert boundary["method"] == "metadata_timestamp"
+    assert boundary["reason"] == reason
+    assert boundary["backdated_us"] == {"numerator": 0, "denominator": 1}
+    assert any(reason in warning for warning in manifest["warnings"])
+
+
+def test_seek_restart_prevents_backdating_into_previous_stream(tmp_path: Path) -> None:
+    """Do not extrapolate a seeked media position into audio from an earlier playback run."""
+    directory = tmp_path / "capture"
+    old_pcm = b"\x11" * 10 * 4
+    seek_pcm = b"\x22" * 20 * 4
+    _capture(
+        directory,
+        [
+            _metadata(0, "Old", progress=_progress(0)),
+            _audio("audio-000001.wav", 0, 10, 0),
+            {"type": "stream_clear", "player_boundary": True},
+            _audio("audio-000002.wav", 0, 20, 10_000_000),
+            _metadata(11_500_000, "New", progress=_progress(10_500)),
+        ],
+        {"audio-000001.wav": old_pcm, "audio-000002.wav": seek_pcm},
+    )
+    manifest, audio = _result(split_tracks(directory))
+    assert b"".join(audio) == old_pcm + seek_pcm
+    assert audio[0] == old_pcm
+    boundary = manifest["tracks"][-1]["boundary_estimate"]
+    assert boundary["reason"] == "would_cross_stream_restart"
+    assert boundary["split_timestamp_us"] == {"numerator": 11_500_000, "denominator": 1}
+
+
+def test_boundary_mode_cli_preserves_timestamp_option(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = tmp_path / "capture"
+    _capture(
+        directory,
+        [
+            _metadata(0, "Old", progress=_progress(0)),
+            _metadata(200_000, "New", progress=_progress(100)),
+            _audio("audio-000001.wav", 0, 4, 0),
+        ],
+        {"audio-000001.wav": bytes(range(16))},
+    )
+    assert parse_args(["split-tracks", str(directory)]).boundary_mode == "progress"
+    monkeypatch.setattr(
+        "sys.argv", ["sendspin", "split-tracks", str(directory), "--boundary-mode", "metadata"]
+    )
+    assert main() == 0
+    manifest, _ = _result(directory / "tracks")
+    assert manifest["boundary_mode"] == "metadata"
+    assert [track["frame_count"] for track in manifest["tracks"]] == [2, 2]
+
+
+@pytest.mark.parametrize("mode", ["progress", "metadata"])
+def test_earlier_offset_moves_only_identity_boundaries(tmp_path: Path, mode: str) -> None:
+    """Apply the extra offset after estimation without shifting same-track observations."""
+    directory = tmp_path / "capture"
+    pcm = bytes(range(200))
+    _capture(
+        directory,
+        [
+            _metadata(0, "Old", progress=_progress(0)),
+            _metadata(2_000_001, "New", progress=_progress(500)),
+            _metadata(3_000_000, "New", progress=_progress(1500)),
+            _audio("audio-000001.wav", 0, 50, 0),
+        ],
+        {"audio-000001.wav": pcm},
+    )
+    boundary_mode: track_splitter.BoundaryMode = "progress" if mode == "progress" else "metadata"
+    manifest, audio = _result(
+        split_tracks(directory, boundary_mode=boundary_mode, boundary_offset_ms=500)
+    )
+    cut_frame = 11 if mode == "progress" else 16
+    assert audio == [pcm[: cut_frame * 4], pcm[cut_frame * 4 :]]
+    assert manifest["boundary_offset_ms"] == 500
+    boundary = manifest["tracks"][1]["boundary_estimate"]
+    assert boundary["applied_offset_us"] == {"numerator": 500_000, "denominator": 1}
+    assert boundary["offset_limit"] is None
+    update = manifest["metadata_events"][2]["boundary_estimate"]
+    assert update["split_timestamp_us"] == {"numerator": 3_000_000, "denominator": 1}
+    assert update["applied_offset_us"] == {"numerator": 0, "denominator": 1}
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_earlier_offset_respects_metadata_and_restart_limits(tmp_path: Path, restart: bool) -> None:
+    """An excessive shift cannot reorder updates or label a preceding stream."""
+    directory = tmp_path / "capture"
+    events = [
+        _metadata(0, "Old", progress=_progress(0)),
+        _audio("audio-000001.wav", 0, 10, 0),
+        _metadata(900_000, "Old", progress=_progress(900)),
+    ]
+    if restart:
+        events.append({"type": "stream_clear", "player_boundary": True})
+    events.extend(
+        [
+            _audio("audio-000002.wav", 0, 10, 1_000_000),
+            _metadata(1_500_000, "New", progress=_progress(100)),
+        ]
+    )
+    _capture(
+        directory,
+        events,
+        {"audio-000001.wav": b"\x11" * 40, "audio-000002.wav": b"\x22" * 40},
+    )
+    manifest, audio = _result(split_tracks(directory, boundary_offset_ms=1000))
+    assert b"".join(audio) == b"\x11" * 40 + b"\x22" * 40
+    boundary = manifest["tracks"][-1]["boundary_estimate"]
+    limit = "stream_restart" if restart else "previous_metadata"
+    assert boundary["offset_limit"] == limit
+    assert boundary["split_timestamp_us"] == {
+        "numerator": 1_000_000 if restart else 900_000,
+        "denominator": 1,
+    }
+    assert any(limit in warning for warning in manifest["warnings"])
+
+
+@pytest.mark.parametrize("offset", [-1, 0.5, True])
+def test_invalid_earlier_offset_does_not_create_output(tmp_path: Path, offset: object) -> None:
+    """Reject invalid offsets before reading input or creating output."""
+    with pytest.raises(ValueError, match="non-negative integer"):
+        split_tracks(tmp_path / "absent", boundary_offset_ms=offset)
+    assert not (tmp_path / "absent").exists()
+
+
+def test_earlier_offset_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pass the requested offset through the CLI into the frame partition."""
+    directory = tmp_path / "capture"
+    _capture(
+        directory,
+        [
+            _metadata(0, "Old"),
+            _metadata(1_500_000, "New"),
+            _audio("audio-000001.wav", 0, 20, 0),
+        ],
+        {"audio-000001.wav": bytes(range(80))},
+    )
+    assert parse_args(["split-tracks", str(directory)]).boundary_offset_ms == 0
+    monkeypatch.setattr(
+        "sys.argv",
+        ["sendspin", "split-tracks", str(directory), "--boundary-offset-ms", "500"],
+    )
+    assert main() == 0
+    manifest, _ = _result(directory / "tracks")
+    assert manifest["boundary_offset_ms"] == 500
+    assert [track["frame_count"] for track in manifest["tracks"]] == [10, 10]

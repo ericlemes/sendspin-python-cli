@@ -553,6 +553,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default="wav",
         help="Output audio format; FLAC and AIFF include text metadata tags (default: wav)",
     )
+    split_parser.add_argument(
+        "--boundary-mode",
+        choices=("progress", "metadata"),
+        default="progress",
+        help="Estimate earlier starts using track progress, or use metadata timestamps (default: progress)",
+    )
+    split_parser.add_argument(
+        "--boundary-offset-ms",
+        type=int,
+        default=0,
+        help="Move track identity boundaries this many milliseconds earlier (non-negative; default: 0)",
+    )
 
     # audio-devices subcommand
     audio_devices_parser = subparsers.add_parser(
@@ -822,7 +834,11 @@ def main() -> int:
 
         try:
             output = split_tracks(
-                args.capture_dir, args.output_dir, output_format=args.output_format
+                args.capture_dir,
+                args.output_dir,
+                output_format=args.output_format,
+                boundary_mode=args.boundary_mode,
+                boundary_offset_ms=args.boundary_offset_ms,
             )
         except (OSError, ValueError) as exc:
             print(f"Track splitting failed: {exc}")

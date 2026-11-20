@@ -280,9 +280,43 @@ supports 16-, 24- and 32-bit PCM. The existing PyAV dependency supplies the enco
 no separate ffmpeg executable is needed. FLAC/AIFF export uses a temporary WAV per
 track, removed after encoding, so allow additional disk space for the largest track.
 
-The splitter uses **current metadata effective timestamps exactly as recorded**;
-it does not subtract reported progress or infer earlier track starts. Canceled scheduled
-updates are ignored. Cuts fall on the first complete sample frame at or after a timestamp.
+The default **`--boundary-mode progress`** compensates for late metadata: on a
+track-identity change it estimates the start as `metadata.timestamp -
+track_progress * 1_000_000 / playback_speed` microseconds. Progress is media time
+in milliseconds and playback speed is scaled by 1000. For example, normal-speed
+metadata reporting 1510 ms of progress moves the cut 1.51 seconds earlier, without
+applying a fixed offset to every track.
+
+Paused, live/unknown-duration, missing or invalid progress falls back to the metadata
+timestamp. An estimate that would cross the previous metadata update or an earlier
+stream restart also falls back and records a warning. Updates to an unchanged track
+do not backdate a new boundary. This is an estimate: it assumes uninterrupted playback
+at the reported speed since track start; seeks, earlier pauses or speed changes can
+invalidate it. It cannot restore audio never received by the capture.
+
+Use **`--boundary-mode metadata`** to retain the original timestamp-only behavior:
+
+```bash
+sendspin split-tracks recordings/20261119T154607Z-ifbmas1g --boundary-mode metadata --output-dir tracks-timestamps
+```
+
+For a capture with consistently late cuts and sufficient silence between songs, use
+**`--boundary-offset-ms 500`** to move track-identity boundaries an additional 500 ms
+earlier. This non-negative integer option works with either boundary mode and defaults
+to **0**, preserving existing behavior:
+
+```bash
+sendspin split-tracks recordings5/20261120T131719Z-wyada_q8 --format flac --boundary-offset-ms 500 --output-dir tracks-offset-500ms
+```
+
+The offset is not silence detection or a universal timing correction: it may include
+the end of the previous song when gaps are too short. Same-track metadata updates are
+not shifted. Shifts are limited at the previous metadata timestamp and, after a stream
+restart, at that run's first received audio timestamp; limitations produce warnings.
+The requested offset and each boundary's actual applied offset are saved in `tracks.json`.
+
+Canceled scheduled updates are ignored. Cuts fall on the first complete sample frame
+at or after the chosen boundary, using rational arithmetic to avoid rounding drift.
 Tracks spanning multiple capture WAVs are joined without lossy encoding, gain changes,
 silence insertion, or removal of overlapping audio. Progress-only and artwork-only
 updates do not create a new track. Changes to title, artist, album, album artist,
@@ -295,7 +329,9 @@ All indexed frames are retained, including received audio that playback later cl
 Consequently, a seek or pause/resume may produce partial or overlapping parts rather
 than a single clean song.
 
-`tracks.json` contains the full current-metadata observations, each output's metadata,
+`tracks.json` contains the selected boundary mode, full current-metadata observations,
+each estimate's original timestamp, chosen timestamp, backdating amount and reason,
+each output's metadata,
 source WAV frame ranges and output offsets, exact rational server-clock start/end
 times, and warnings. Its `complete` field means splitting completed, **not** that the
 tracks have proven musical boundaries or that the input capture was complete. A failed
@@ -303,7 +339,7 @@ write leaves a report marked incomplete when possible; use a different output di
 for a retry.
 
 This is a lossless diagnostic partition, not guaranteed track-perfect extraction:
-late metadata can place a small portion of the next song in the previous file;
+inaccurate progress or timestamp-only fallbacks can still misplace musical boundaries;
 crossfades and consecutive plays of the same metadata cannot be reliably separated.
 The report preserves the source mapping so these decisions can be revisited.
 

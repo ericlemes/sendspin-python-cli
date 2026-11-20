@@ -7,7 +7,7 @@ import re
 import wave
 from bisect import bisect_right
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
@@ -18,6 +18,7 @@ _IDENTITY_FIELDS = ("title", "artist", "album", "album_artist", "track", "year")
 _BOUNDARIES = {"client_attached", "disconnect", "stream_start", "stream_clear", "stream_end"}
 _COPY_FRAMES = 65_536
 type ExportFormat = Literal["wav", "flac", "aiff"]
+type BoundaryMode = Literal["progress", "metadata"]
 _TEXT_TAGS = {
     "title": "title",
     "artist": "artist",
@@ -80,9 +81,11 @@ def _object(value: object, description: str) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class _Metadata:
-    timestamp: int
+    timestamp: Fraction
     data: dict[str, Any]
     reference: int
+    run: int
+    boundary: dict[str, Any] = field(default_factory=dict)
 
     @property
     def identity(self) -> tuple[object, ...]:
@@ -167,7 +170,7 @@ def _read_capture(directory: Path) -> _Capture:  # noqa: PLR0912, PLR0915
                     if event.get("payload") is None:
                         epoch += 1
                         run += 1
-                    _read_metadata(capture, event, epoch, line_number)
+                    _read_metadata(capture, event, epoch, run, line_number)
                 elif kind == "audio":
                     name = event.get("file")
                     if not isinstance(name, str):
@@ -201,7 +204,9 @@ def _read_capture(directory: Path) -> _Capture:  # noqa: PLR0912, PLR0915
     return capture
 
 
-def _read_metadata(capture: _Capture, event: dict[str, Any], epoch: int, line_number: int) -> None:
+def _read_metadata(
+    capture: _Capture, event: dict[str, Any], epoch: int, run: int, line_number: int
+) -> None:
     reference = len(capture.metadata)
     capture.metadata.append({"journal_line": line_number, "epoch": epoch, "event": event})
     payload = event.get("payload")
@@ -217,11 +222,103 @@ def _read_metadata(capture: _Capture, event: dict[str, Any], epoch: int, line_nu
         return
     data = _object(payload["metadata"], "metadata")
     timestamp = _integer(data, "timestamp")
-    capture.timelines.setdefault(epoch, []).append(_Metadata(timestamp, data, reference))
+    capture.timelines.setdefault(epoch, []).append(
+        _Metadata(Fraction(timestamp), data, reference, run)
+    )
 
 
 def _rational(value: Fraction) -> dict[str, int]:
     return {"numerator": value.numerator, "denominator": value.denominator}
+
+
+def _progress_start(metadata: _Metadata) -> tuple[Fraction | None, str]:
+    progress = metadata.data.get("progress")
+    if not isinstance(progress, dict):
+        return None, "missing_progress"
+    position = progress.get("track_progress")
+    duration = progress.get("track_duration")
+    speed = progress.get("playback_speed")
+    if type(position) is not int or type(duration) is not int or type(speed) is not int:
+        return None, "invalid_progress"
+    if speed == 0:
+        return None, "paused"
+    if duration == 0:
+        return None, "unknown_or_live_duration"
+    if speed < 0 or duration < 0 or position < 0 or position > duration:
+        return None, "invalid_progress"
+    # Progress is milliseconds of media time; speed is a multiplier scaled by 1000.
+    return metadata.timestamp - Fraction(position * 1_000_000, speed), "progress_estimate"
+
+
+def _estimate_boundaries(capture: _Capture, mode: BoundaryMode, offset_ms: int = 0) -> None:
+    """Backdate identity changes, not progress updates, without crossing prior state."""
+    run_starts: dict[tuple[int, int], Fraction] = {}
+    first_runs: dict[int, int] = {}
+    for span in capture.spans:
+        key = (span.epoch, span.run)
+        run_starts[key] = min(run_starts.get(key, span.start), span.start)
+        first_runs[span.epoch] = min(first_runs.get(span.epoch, span.run), span.run)
+    for epoch, timeline in capture.timelines.items():
+        previous: _Metadata | None = None
+        adjusted = []
+        for metadata in timeline:
+            timestamp = metadata.timestamp
+            reason = "metadata_timestamp"
+            is_change = previous is None or previous.identity != metadata.identity
+            if mode == "progress" and is_change and metadata.data.get("title"):
+                candidate, reason = _progress_start(metadata)
+                if candidate is not None:
+                    if previous is not None and candidate < previous.timestamp:
+                        reason = "would_cross_previous_metadata"
+                    elif (
+                        metadata.run > first_runs.get(epoch, metadata.run)
+                        and (run_start := run_starts.get((epoch, metadata.run))) is not None
+                        and candidate < run_start
+                    ):
+                        reason = "would_cross_stream_restart"
+                    else:
+                        timestamp = candidate
+                if reason != "progress_estimate":
+                    capture.warnings.append(
+                        f"{metadata.data['title']!r}: using metadata timestamp "
+                        f"({reason}); its musical boundary remains uncertain."
+                    )
+            elif mode == "progress" and not is_change:
+                reason = "same_track_update"
+            before_offset = timestamp
+            offset_limit = None
+            if offset_ms and is_change and metadata.data.get("title"):
+                timestamp -= offset_ms * 1000
+                if previous is not None and timestamp < previous.timestamp:
+                    timestamp = previous.timestamp
+                    offset_limit = "previous_metadata"
+                if (
+                    metadata.run > first_runs.get(epoch, metadata.run)
+                    and (run_start := run_starts.get((epoch, metadata.run))) is not None
+                    and timestamp < run_start
+                ):
+                    timestamp = run_start
+                    offset_limit = "stream_restart"
+                if offset_limit is not None:
+                    capture.warnings.append(
+                        f"{metadata.data['title']!r}: earlier boundary offset limited by "
+                        f"{offset_limit}."
+                    )
+            boundary = {
+                "method": "progress_estimate"
+                if reason == "progress_estimate"
+                else "metadata_timestamp",
+                "reason": reason,
+                "metadata_timestamp_us": metadata.data["timestamp"],
+                "split_timestamp_us": _rational(timestamp),
+                "backdated_us": _rational(metadata.timestamp - timestamp),
+                "applied_offset_us": _rational(before_offset - timestamp),
+                "offset_limit": offset_limit,
+            }
+            capture.metadata[metadata.reference]["boundary_estimate"] = boundary
+            adjusted.append(replace(metadata, timestamp=timestamp, boundary=boundary))
+            previous = metadata
+        timeline[:] = adjusted
 
 
 class _TrackWriter:
@@ -300,6 +397,7 @@ class _TrackWriter:
             {
                 "file": filename,
                 "metadata": data,
+                "boundary_estimate": metadata.boundary if metadata is not None else None,
                 "metadata_refs": [],
                 "frame_count": 0,
                 "sample_rate": span.params[2],
@@ -337,13 +435,23 @@ class _TrackWriter:
 
 
 def split_tracks(
-    capture_dir: Path, output_dir: Path | None = None, *, output_format: ExportFormat = "wav"
+    capture_dir: Path,
+    output_dir: Path | None = None,
+    *,
+    output_format: ExportFormat = "wav",
+    boundary_mode: BoundaryMode = "progress",
+    boundary_offset_ms: int = 0,
 ) -> Path:
     """Partition captured frames by current metadata and export lossless audio."""
     if output_format not in {"wav", "flac", "aiff"}:
         raise ValueError(f"Unsupported output format: {output_format}")
+    if boundary_mode not in {"progress", "metadata"}:
+        raise ValueError(f"Unsupported boundary mode: {boundary_mode}")
+    if type(boundary_offset_ms) is not int or boundary_offset_ms < 0:
+        raise ValueError("boundary_offset_ms must be a non-negative integer")
     directory = capture_dir.resolve()
     capture = _read_capture(directory)
+    _estimate_boundaries(capture, boundary_mode, boundary_offset_ms)
     if output_format != "wav":
         for channels, width, _rate in capture.params.values():
             if channels not in (1, 2) or width not in (2, 3, 4):
@@ -354,18 +462,35 @@ def split_tracks(
                 )
     output = output_dir.resolve() if output_dir is not None else directory / "tracks"
     warnings = [
-        "Boundaries use metadata effective timestamps, not proven track starts. "
-        "Progress is not subtracted; seeks, crossfades and late metadata may mislabel audio.",
+        (
+            "Boundaries estimate track starts from metadata progress and current playback speed. "
+            "This assumes constant playback speed since track start; seeks, pauses and crossfades "
+            "can invalidate the estimate. Guarded or missing progress falls back to metadata time."
+            if boundary_mode == "progress"
+            else "Boundaries use metadata effective timestamps, not proven track starts. "
+            "Progress is not subtracted; seeks, crossfades and late metadata may mislabel audio."
+        ),
         "All received PCM is retained, including buffered audio later cleared by the player. "
         "Repeated tracks with identical metadata cannot reliably be distinguished.",
         *capture.warnings,
     ]
+    if boundary_offset_ms:
+        warnings.append(
+            f"Track identity boundaries moved {boundary_offset_ms} ms earlier where safe. "
+            "This fixed offset is not silence detection and may include the previous track's audio."
+        )
     output.mkdir(parents=True, exist_ok=False)
     writer = _TrackWriter(output, output_format)
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "capture_dir": str(directory),
-        "boundary_method": "metadata_effective_timestamp",
+        "boundary_method": (
+            "progress_estimated_track_start"
+            if boundary_mode == "progress"
+            else "metadata_effective_timestamp"
+        ),
+        "boundary_mode": boundary_mode,
+        "boundary_offset_ms": boundary_offset_ms,
         "output_format": output_format,
         "complete": False,
         "warnings": warnings,
